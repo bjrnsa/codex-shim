@@ -39,8 +39,7 @@ from .settings import (
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_DIR = PROJECT_ROOT / ".codex-shim"
+RUNTIME_DIR = Path.home() / ".codex-shim"
 CATALOG_PATH = RUNTIME_DIR / "custom_model_catalog.json"
 CONFIG_PATH = RUNTIME_DIR / "config.toml"
 PID_PATH = RUNTIME_DIR / "shim.pid"
@@ -258,7 +257,6 @@ def start(settings_path: Path, port: int) -> int:
         str(port),
     ]
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     process = _popen_daemon(cmd, log, env)
     PID_PATH.write_text(str(process.pid))
     for _ in range(50):
@@ -770,7 +768,7 @@ def _remove_section(text: str, section: str) -> str:
 
 
 def _popen_daemon(cmd: list[str], log, env: dict[str, str]) -> subprocess.Popen:
-    kwargs = {"cwd": str(PROJECT_ROOT), "env": env, "stdout": log, "stderr": log}
+    kwargs = {"cwd": str(Path.home()), "env": env, "stdout": log, "stderr": log}
     if os.name == "nt":
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
         return subprocess.Popen(cmd, creationflags=creationflags, **kwargs)
@@ -940,6 +938,19 @@ def _entrypoint() -> int:
             pass
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 0
+
+
+def _codex_app_entrypoint() -> int:
+    sys.argv[1:1] = ["app"]
+    return _entrypoint()
+
+
+def _codex_model_entrypoint() -> int:
+    if len(sys.argv) <= 1 or sys.argv[1] == "list":
+        sys.argv[1:] = ["model", "list"]
+    else:
+        sys.argv[1:1] = ["model", "use"]
+    return _entrypoint()
 
 
 if __name__ == "__main__":

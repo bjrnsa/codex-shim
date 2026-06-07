@@ -20,7 +20,7 @@ fi
 # Remove any stale BYOK standardagents entry that would require CURSOR_API_KEY.
 MODELS_JSON="${HOME}/.codex-shim/models.json"
 mkdir -p "${HOME}/.codex-shim"
-python3 - "${MODELS_JSON}" <<'PY'
+uv run --directory "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" python - "${MODELS_JSON}" <<'PY'
 import json
 import sys
 from pathlib import Path

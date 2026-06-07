@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "codex-shim"
@@ -30,6 +30,12 @@ dev = [
   "pytest-asyncio>=0.23",
 ]
 
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+]
+
 [project.urls]
 Homepage = "https://github.com/0xSero/codex-shim"
 Repository = "https://github.com/0xSero/codex-shim"
@@ -37,6 +43,8 @@ Issues = "https://github.com/0xSero/codex-shim/issues"
 
 [project.scripts]
 codex-shim = "codex_shim.cli:_entrypoint"
+codex-app = "codex_shim.cli:_codex_app_entrypoint"
+codex-model = "codex_shim.cli:_codex_model_entrypoint"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

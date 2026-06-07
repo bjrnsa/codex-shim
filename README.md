@@ -74,13 +74,13 @@ local:
 
 ## Install
 
-Recommended on macOS/Linux/WSL/Git Bash (installs the `codex-shim` entry
-point from `pyproject.toml`):
+Recommended on macOS/Linux/WSL/Git Bash (uses `uv` to manage dependencies
+and run the `codex-shim` entry point from `pyproject.toml`):
 
 ```bash
 git clone https://github.com/0xSero/codex-shim ~/codex-shim
 cd ~/codex-shim
-python3 -m pip install --user -e .
+uv sync
 ```
 
 Recommended on native Windows PowerShell/cmd:
@@ -88,59 +88,25 @@ Recommended on native Windows PowerShell/cmd:
 ```powershell
 git clone https://github.com/0xSero/codex-shim $HOME\codex-shim
 cd $HOME\codex-shim
-py -3.11 -m pip install --user -e .
+uv sync
 ```
 
-That pulls in `aiohttp` and installs the portable Python console command
-`codex-shim`. On POSIX-like shells, the optional `codex-app` and `codex-model`
-shortcuts live in `bin/`; symlink them if you want them on `PATH` too:
-
+If you don't have `uv` yet, install it:
 ```bash
-mkdir -p ~/.local/bin
-ln -sf "$PWD/bin/codex-app" ~/.local/bin/codex-app
-ln -sf "$PWD/bin/codex-model" ~/.local/bin/codex-model
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Windows
+powershell -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-If you move the checkout, recreate those symlinks; `codex-shim app` launches
-`codex app` through the installed Python entry point and does not need them.
-
-Alternative on macOS/Linux/WSL/Git Bash (no install, run straight from the
-checkout):
-
-```bash
-git clone https://github.com/0xSero/codex-shim ~/codex-shim
-cd ~/codex-shim
-python3 -m pip install --user aiohttp
-mkdir -p ~/.local/bin
-ln -sf "$PWD/bin/codex-shim" ~/.local/bin/codex-shim
-ln -sf "$PWD/bin/codex-app" ~/.local/bin/codex-app
-ln -sf "$PWD/bin/codex-model" ~/.local/bin/codex-model
-```
+That pulls in `aiohttp` and makes `codex-shim` (plus `codex-app` and `codex-model`
+shortcuts) available via `uv run`.
 
 For running the test suite:
 
 ```bash
-python3 -m pip install --user pytest pytest-asyncio
-```
-
-If your POSIX shell cannot find the commands, make sure `~/.local/bin` is on
-`PATH`:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-If PowerShell cannot find `codex-shim`, add your Python user Scripts directory
-to `Path`. For Python 3.11 installed from python.org, the usual path is:
-
-```powershell
-$env:APPDATA\Python\Python311\Scripts
-```
-
-You can also skip `PATH` entirely and run through Python:
-
-```powershell
-py -3.11 -m codex_shim.cli status
+uv sync --dev
+uv run pytest tests/ -q
 ```
 
 ---
@@ -153,26 +119,21 @@ Use one of these setups:
 
 | Setup | Status | Notes |
 |---|---|---|
-| Native Windows PowerShell/cmd | Supported | Install with `py -3.11 -m pip install --user -e .` and run `codex-shim ...`. |
+| Native Windows PowerShell/cmd | Supported | Install with `uv sync` and run `uv run codex-shim ...`. |
 | WSL | Supported | Works like Linux. Best when Codex CLI/Desktop is also being driven from WSL. |
 | Git Bash | Supported | Works with the POSIX `bin/` wrappers if Python/Codex are on `PATH`. |
-| `bin/codex-app`, `bin/codex-model` in PowerShell/cmd | Not native | These are shell scripts. Use `codex-shim app ...` and `codex-shim model ...` instead. |
+| `bin/codex-app`, `bin/codex-model` in PowerShell/cmd | Not native | These are shell scripts. Use `uv run codex-app ...` and `uv run codex-model ...` instead. |
 | `patch-app` / `restore-app` | macOS only | They target `/Applications/Codex.app` and Electron ASAR signing on macOS. |
 
 Native Windows quick check:
 
 ```powershell
-py -3.11 -m pip install --user -e .
-codex-shim generate
-codex-shim start
-codex-shim status
-codex-shim list
+uv sync
+uv run codex-shim generate
+uv run codex-shim start
+uv run codex-shim status
+uv run codex-shim list
 ```
-
-If `codex-shim` is not on `Path`, use the module form:
-
-```powershell
-py -3.11 -m codex_shim.cli generate
 py -3.11 -m codex_shim.cli start
 py -3.11 -m codex_shim.cli status
 ```
@@ -904,7 +865,7 @@ the shim, so a visited web page cannot drive them via DNS rebinding.
   it cannot make an upstream model reliably emit valid tool-call JSON.
 - Hosted Responses-only tools are highest fidelity on the ChatGPT passthrough
   path. BYOK routes get normal function-tool translation.
-- The `bin/codex-app` and `bin/codex-model` shortcuts are POSIX shell scripts.
+- `codex-app` and `codex-model` are installed as console entry points alongside `codex-shim`.
   In native Windows shells, use the installed `codex-shim` command instead.
 
 ---
@@ -1048,9 +1009,9 @@ codex-shim start
 
 ```text
 codex_shim/             python source (server + cli + translation)
-bin/codex-shim          main entrypoint
-bin/codex-app           shortcut wrapping `codex-shim app`
-bin/codex-model         shortcut wrapping `codex-shim model …`
+codex-shim               main entrypoint
+codex-app                shortcut for `codex-shim app`
+codex-model              shortcut for `codex-shim model …`
 .codex-shim/            generated catalog, config, logs, pid (gitignored)
 tests/                  pytest suite
 ```

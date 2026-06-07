@@ -7,6 +7,12 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Changed
+
+- Migrated to uv-native tooling: build backend switched from setuptools to
+  hatchling, added `uv.lock`, all documentation/scripts/CI now use `uv sync`
+  and `uv run` instead of `pip install`.
+
 ### Added
 
 - Auto Router (`codex_shim/router.py`): an optional `Auto (smart routing)` picker

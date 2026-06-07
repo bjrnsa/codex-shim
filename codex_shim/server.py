@@ -51,7 +51,7 @@ from .translate import (
     responses_to_chat,
 )
 
-DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
+DEBUG_DIR = Path.home() / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 
 

@@ -7,7 +7,7 @@ $port = 8766
 if ($env:CODEX_SHIM_PORT) { $port = [int]$env:CODEX_SHIM_PORT }
 $templatePath = Join-Path $HOME ".codex-shim\models.json"
 $resolvedPath = Join-Path $HOME ".codex-shim\models.resolved.json"
-$catalogPath = Join-Path $repoRoot ".codex-shim\custom_model_catalog.json"
+$catalogPath = Join-Path $HOME ".codex-shim\custom_model_catalog.json"
 
 $costInfo = @{
     "glm-5.1"           = @{ cost = 0.014; tier = "Premium";   limit5h = 880;   limitMo = 4300 }
@@ -26,15 +26,11 @@ $costInfo = @{
 $tierColor = @{ "Economy" = "Green"; "Standard" = "Yellow"; "Premium" = "Red" }
 
 function Get-ShimCommand {
-    $py = Get-Command "py" -ErrorAction SilentlyContinue
-    if ($py) { return [PSCustomObject]@{ File = $py.Source; Args = @("-3", "-m", "codex_shim.cli") } }
-    $python3 = Get-Command "python3" -ErrorAction SilentlyContinue
-    if ($python3) { return [PSCustomObject]@{ File = $python3.Source; Args = @("-m", "codex_shim.cli") } }
-    $python = Get-Command "python" -ErrorAction SilentlyContinue
-    if ($python) { return [PSCustomObject]@{ File = $python.Source; Args = @("-m", "codex_shim.cli") } }
+    $uv = Get-Command "uv" -ErrorAction SilentlyContinue
+    if ($uv) { return [PSCustomObject]@{ File = $uv.Source; Args = @("run", "--directory", $repoRoot, "codex-shim") } }
     $installed = Get-Command "codex-shim" -ErrorAction SilentlyContinue
     if ($installed) { return [PSCustomObject]@{ File = $installed.Source; Args = @() } }
-    throw "Could not find Python or codex-shim on PATH. Install with: py -3.11 -m pip install --user -e ."
+    throw "Could not find uv or codex-shim on PATH. Install uv: https://docs.astral.sh/uv/getting-started/installation/"
 }
 
 $shimCommand = Get-ShimCommand
@@ -42,14 +38,8 @@ $shimCommand = Get-ShimCommand
 function Invoke-Shim {
     param([string[]]$Arguments)
 
-    $oldPythonPath = $env:PYTHONPATH
-    try {
-        if ($oldPythonPath) { $env:PYTHONPATH = "$repoRoot;$oldPythonPath" } else { $env:PYTHONPATH = $repoRoot }
-        $baseArgs = @($shimCommand.Args) + @("--settings", $resolvedPath, "--port", [string]$port) + @($Arguments)
-        & $shimCommand.File @baseArgs
-    } finally {
-        if ($null -eq $oldPythonPath) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $oldPythonPath }
-    }
+    $baseArgs = @($shimCommand.Args) + @("--settings", $resolvedPath, "--port", [string]$port) + @($Arguments)
+    & $shimCommand.File @baseArgs
 }
 
 function Get-EnvVarValue($name) {

@@ -9,5 +9,5 @@ while [ -h "$SOURCE" ]; do
 done
 
 ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
-exec "$ROOT/bin/codex-shim" app "$@"
+exec uv run --directory "$ROOT" codex-shim app "$@"
 

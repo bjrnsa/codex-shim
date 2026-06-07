@@ -11,8 +11,8 @@ done
 ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
 if [ "$#" -eq 0 ] || [ "${1:-}" = "list" ]; then
-  exec "$ROOT/bin/codex-shim" model list
+  exec uv run --directory "$ROOT" codex-shim model list
 fi
 
-exec "$ROOT/bin/codex-shim" model use "$1"
+exec uv run --directory "$ROOT" codex-shim model use "$1"
 
