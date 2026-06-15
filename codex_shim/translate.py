@@ -27,7 +27,7 @@ def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
     return data
 
 
-def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+def responses_to_chat(body: dict[str, Any], upstream_model: str, supports_parallel_tool_calls: bool = True) -> dict[str, Any]:
     messages = []
     instructions = body.get("instructions")
     if instructions:
@@ -55,7 +55,8 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
     _copy_if_present(body, chat, "top_p")
     _copy_if_present(body, chat, "max_output_tokens", "max_tokens")
     _copy_if_present(body, chat, "max_tokens")
-    _copy_if_present(body, chat, "parallel_tool_calls")
+    if supports_parallel_tool_calls:
+        _copy_if_present(body, chat, "parallel_tool_calls")
     _copy_if_present(body, chat, "reasoning_effort")
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))

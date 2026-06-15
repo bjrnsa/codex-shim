@@ -652,7 +652,7 @@ run as an agent:
 | `shell_type` | `shell_command` |
 | `apply_patch_tool_type` | `freeform` |
 | `web_search_tool_type` | `text_and_image` |
-| `supports_parallel_tool_calls` | `true` |
+| `supports_parallel_tool_calls` | `true` unless `noParallelToolCalls: true` |
 | `input_modalities` | `text,image` unless `noImageSupport: true` |
 | `supports_image_detail_original` | disabled when `noImageSupport: true` |
 

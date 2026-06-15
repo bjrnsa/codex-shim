@@ -179,6 +179,7 @@ class ShimModel:
     max_context_limit: int | None = None
     max_output_tokens: int | None = None
     no_image_support: bool = False
+    no_parallel_tool_calls: bool = False
     extra_headers: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -244,6 +245,7 @@ class ModelSettings:
                     max_context_limit=_int_or_none(_field(row, "max_context_limit", "maxContextLimit")),
                     max_output_tokens=_int_or_none(_field(row, "max_output_tokens", "maxOutputTokens")),
                     no_image_support=bool(_field(row, "no_image_support", "noImageSupport", default=False)),
+                    no_parallel_tool_calls=bool(_field(row, "no_parallel_tool_calls", "noParallelToolCalls", default=False)),
                     extra_headers=extra_headers,
                     raw=row,
                 )

@@ -45,6 +45,7 @@ Issues = "https://github.com/0xSero/codex-shim/issues"
 codex-shim = "codex_shim.cli:_entrypoint"
 codex-app = "codex_shim.cli:_codex_app_entrypoint"
 codex-model = "codex_shim.cli:_codex_model_entrypoint"
+codex-shim-server = "codex_shim.server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

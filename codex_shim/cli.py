@@ -3,12 +3,10 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import ctypes
-import signal
+import hashlib
 import subprocess
 import sys
 import time
-import hashlib
 import json
 import plistlib
 import struct
@@ -42,15 +40,11 @@ from .settings import (
 RUNTIME_DIR = Path.home() / ".codex-shim"
 CATALOG_PATH = RUNTIME_DIR / "custom_model_catalog.json"
 CONFIG_PATH = RUNTIME_DIR / "config.toml"
-PID_PATH = RUNTIME_DIR / "shim.pid"
-LOG_PATH = RUNTIME_DIR / "shim.log"
+PITCHFORK_PATH = RUNTIME_DIR / "pitchfork.toml"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 CODEX_CONFIG_BACKUP_PATH = RUNTIME_DIR / "config.toml.before-codex-shim"
 MANAGED_BEGIN = "# >>> codex-shim managed >>>"
 MANAGED_END = "# <<< codex-shim managed <<<"
-WINDOWS_PROCESS_TERMINATE = 0x0001
-WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-WINDOWS_STILL_ACTIVE = 259
 PREVIOUS_TOP_LEVEL_PREFIX = "# codex-shim previous-top-level = "
 MANAGED_TOP_LEVEL_KEYS = {"model", "model_provider", "model_catalog_json"}
 APP_ASAR_BACKUP_NAME = "app.asar.before-codex-shim-model-picker-patch"
@@ -115,9 +109,8 @@ def main(argv: list[str] | None = None) -> int:
             restore_codex_config()
         return stop()
     if args.command == "restart":
-        stop()
         generate(args.settings, args.port)
-        return start(args.settings, args.port)
+        return _pitchfork("start", "shim", "--force")
     if args.command == "status":
         return status(args.port)
     if args.command == "patch-app":
@@ -177,11 +170,13 @@ def generate(settings_path: Path, port: int) -> None:
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
     write_catalog(models, CATALOG_PATH, router_config=router_config)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
+    _write_pitchfork_config(settings_path, port)
     print(f"Generated {len(models)} model entries:")
     if _active_router(models, settings_path) is not None:
         print(f"  auto router: {router_config.slug} ({router_config.display_name})")
     print(f"  catalog: {CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
+    print(f"  daemon:  {PITCHFORK_PATH}")
     print("No files under ~/.codex were modified.")
 
 
@@ -240,53 +235,35 @@ def list_models(settings_path: Path) -> int:
 
 
 def start(settings_path: Path, port: int) -> int:
-    if _pid_running(_read_pid()):
-        print(f"Shim already running with pid {_read_pid()}.")
-        return 0
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    log = LOG_PATH.open("ab")
-    cmd = [
-        sys.executable,
-        "-m",
-        "codex_shim.server",
-        "--settings",
-        str(settings_path),
-        "--host",
-        DEFAULT_HOST,
-        "--port",
-        str(port),
-    ]
-    env = os.environ.copy()
-    process = _popen_daemon(cmd, log, env)
-    PID_PATH.write_text(str(process.pid))
-    for _ in range(50):
-        if _healthy(port):
-            print(f"Shim started on http://{DEFAULT_HOST}:{port} with pid {process.pid}.")
-            print(f"Log: {LOG_PATH}")
-            return 0
-        if process.poll() is not None:
-            print(f"Shim exited during startup. See {LOG_PATH}.", file=sys.stderr)
-            return 1
-        time.sleep(0.1)
-    print(f"Shim process started but health check timed out. See {LOG_PATH}.", file=sys.stderr)
-    return 1
+    return _pitchfork("start", "shim")
 
 
 def stop() -> int:
-    pid = _read_pid()
-    if not _pid_running(pid):
-        print("Shim is not running.")
-        PID_PATH.unlink(missing_ok=True)
-        return 0
-    _terminate_pid(pid)
-    for _ in range(50):
-        if not _pid_running(pid):
-            PID_PATH.unlink(missing_ok=True)
-            print("Shim stopped.")
-            return 0
-        time.sleep(0.1)
-    print(f"Shim pid {pid} did not exit after SIGTERM.", file=sys.stderr)
-    return 1
+    return _pitchfork("stop", "shim")
+
+
+def status(port: int) -> int:
+    return _pitchfork("status", "shim")
+
+
+def ensure_started(settings_path: Path, port: int) -> None:
+    code = _pitchfork("start", "shim")
+    if code:
+        raise SystemExit(code)
+
+
+def _pitchfork(*args: str) -> int:
+    return subprocess.call(["pitchfork", *args], cwd=str(PITCHFORK_PATH.parent))
+
+
+def _healthy(port: int) -> dict | None:
+    try:
+        with urlopen(f"http://{DEFAULT_HOST}:{port}/health", timeout=2) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read())
+    except Exception:
+        pass
+    return None
 
 
 def restore_codex_config() -> None:
@@ -303,28 +280,6 @@ def restore_codex_config() -> None:
     if CODEX_CONFIG_BACKUP_PATH.exists():
         CODEX_CONFIG_BACKUP_PATH.unlink()
         print(f"Removed stale shim backup {CODEX_CONFIG_BACKUP_PATH}.")
-
-
-def status(port: int) -> int:
-    pid = _read_pid()
-    if _pid_running(pid):
-        health = _health(port)
-        if health is not None:
-            model_count = health.get("models", "unknown")
-            print(f"Shim is running on http://{DEFAULT_HOST}:{port} with pid {pid} ({model_count} models).")
-            return 0
-    if _pid_running(pid):
-        print(f"Shim process {pid} exists but health check failed.")
-        return 1
-    print("Shim is stopped.")
-    return 1
-
-
-def ensure_started(settings_path: Path, port: int) -> None:
-    if not (_pid_running(_read_pid()) and _healthy(port)):
-        code = start(settings_path, port)
-        if code:
-            raise SystemExit(code)
 
 
 def exec_codex(settings_path: Path, port: int, codex_args: list[str]) -> None:
@@ -767,26 +722,6 @@ def _remove_section(text: str, section: str) -> str:
     return "\n".join(output) + ("\n" if text.endswith("\n") else "")
 
 
-def _popen_daemon(cmd: list[str], log, env: dict[str, str]) -> subprocess.Popen:
-    kwargs = {"cwd": str(Path.home()), "env": env, "stdout": log, "stderr": log}
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-        return subprocess.Popen(cmd, creationflags=creationflags, **kwargs)
-    return subprocess.Popen(cmd, start_new_session=True, **kwargs)
-
-
-def _terminate_pid(pid: int) -> None:
-    if os.name == "nt":
-        handle = ctypes.windll.kernel32.OpenProcess(WINDOWS_PROCESS_TERMINATE, False, pid)
-        if handle:
-            try:
-                ctypes.windll.kernel32.TerminateProcess(handle, 0)
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
-        return
-    os.kill(pid, signal.SIGTERM)
-
-
 def _override_args(settings_path: Path, port: int) -> list[str]:
     models = _load_models(settings_path)
     try:
@@ -883,46 +818,17 @@ def _valid_model_slugs(models, router_config=None) -> set[str]:
     return slugs
 
 
-def _healthy(port: int) -> bool:
-    return _health(port) is not None
-
-
-def _health(port: int) -> dict | None:
-    try:
-        with urlopen(f"http://{DEFAULT_HOST}:{port}/health", timeout=0.5) as response:
-            if response.status != 200:
-                return None
-            return json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return None
-
-
-def _read_pid() -> int | None:
-    try:
-        return int(PID_PATH.read_text().strip())
-    except Exception:
-        return None
-
-
-def _pid_running(pid: int | None) -> bool:
-    if not pid:
-        return False
-    if os.name == "nt":
-        handle = ctypes.windll.kernel32.OpenProcess(WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            exit_code = ctypes.c_ulong()
-            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return False
-            return exit_code.value == WINDOWS_STILL_ACTIVE
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+def _write_pitchfork_config(settings_path: Path, port: int) -> None:
+    PITCHFORK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PITCHFORK_PATH.write_text(
+        f"""\
+[daemons.shim]
+run = "codex-shim-server --settings {settings_path} --port {port}"
+port = {{ expect = [{port}], bump = false }}
+ready_http = "http://127.0.0.1:{port}/health"
+retry = 3
+"""
+    )
 
 
 def _entrypoint() -> int:
