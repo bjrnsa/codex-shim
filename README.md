@@ -286,13 +286,14 @@ Recommended schema:
 }
 ```
 
-The loader also accepts camelCase aliases (`baseUrl`, `apiKey`, `displayName`,
-`maxContextLimit`, `maxOutputTokens`, `noImageSupport`, `extraHeaders`) and a
-legacy top-level `customModels` array, so existing model config exports can be
-used directly.
+The loader also accepts camelCase aliases (`baseUrl`, `apiKey`, `apiKeyEnv`,
+`displayName`, `maxContextLimit`, `maxOutputTokens`, `noImageSupport`,
+`extraHeaders`) and a legacy top-level `customModels` array, so existing model
+config exports can be used directly.
 
-The shim **never copies your API keys** into the generated catalog. Keys stay
-in your settings file and are read fresh on every request.
+The shim **never writes your API keys** into the generated catalog. Put literal
+keys in your settings file or reference them with `api_key_env`; credentials
+are resolved when requests are handled.
 
 Supported `provider` values:
 
@@ -302,15 +303,72 @@ Supported `provider` values:
 | `generic-chat-completion-api` | OpenAI-shaped chat completions |
 | `anthropic` | Anthropic `/v1/messages` |
 
+The shim also accepts Anthropic Messages requests at
+`http://127.0.0.1:8765/v1/messages`. For `openai` and
+`generic-chat-completion-api` models, it translates Messages requests to
+OpenAI-shaped chat completions and converts responses back to Anthropic shape.
+For `anthropic` models, it passes the request through to the upstream
+`/messages` endpoint with the configured model name. The bridge supports text,
+image inputs, basic function tools/tool results, and streaming SSE. Provider
+features such as prompt caching, extended thinking signatures, files, and token
+counting remain upstream-specific.
+
 Useful model fields:
 
 | field | behavior |
 |---|---|
 | `display_name` | Human-readable picker label. |
+| `api_key_env` | Name of an environment variable that contains the upstream API key. |
 | `max_context_limit` | Catalog context window and compaction limits. |
 | `max_output_tokens` | Default max output when translating to Anthropic. |
 | `no_image_support` | When true, catalog advertises text-only input. |
 | `extra_headers` | Optional upstream headers merged into requests. |
+
+### OpenCode Go
+
+OpenCode Go adds and updates models over time. Refresh the local settings from
+the live OpenCode Go catalog instead of copying a hard-coded model list:
+
+```bash
+export OPENCODE_GO_API_KEY="..."
+codex-shim opencode-go refresh
+codex-shim generate
+codex-shim start
+```
+
+The refresh command calls `https://opencode.ai/zen/go/v1/models`, probes each
+model through both `/chat/completions` and `/messages`, and writes `ocgo-*`
+entries into `~/.codex-shim/models.json`. Models that work through chat
+completions are configured as `generic-chat-completion-api`; models that only
+work through Messages are configured as `anthropic`.
+
+Use `--settings` to write a different file, `--api-key-env` to use a different
+environment variable name, or `--prefer messages` if you want models that
+support both routes to prefer Anthropic Messages:
+
+```bash
+codex-shim --settings /path/to/models.json opencode-go refresh --prefer messages
+```
+
+If you need a minimal manual fallback, add one model with the same key env:
+
+```json
+{
+  "models": [
+    {
+      "slug": "ocgo-glm-5-1",
+      "model": "glm-5.1",
+      "display_name": "OpenCode Go GLM 5.1",
+      "provider": "generic-chat-completion-api",
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "api_key_env": "OPENCODE_GO_API_KEY"
+    }
+  ]
+}
+```
+
+The current OpenCode Go model list and endpoint split are documented at
+<https://opencode.ai/docs/go/>.
 
 ### Ollama / local OpenAI-compatible chat endpoints
 
@@ -790,10 +848,13 @@ codex-shim generate          regenerate catalog/config without starting daemon
 codex-shim start             regenerate catalog and start local shim daemon
 codex-shim enable            start daemon and write managed ~/.codex/config.toml block
 codex-shim status            health check + model count
+codex-shim doctor            read-only local diagnostics report
 codex-shim stop              stop daemon
 codex-shim disable           remove managed config block and stop daemon
 codex-shim restart           stop, regenerate, and start daemon
 codex-shim list              list generated slugs and upstream routes
+codex-shim opencode-go refresh
+                            refresh OpenCode Go models into the settings file
 codex-shim model list        list slugs currently usable in the picker
 codex-shim model use <slug>  set the Desktop default model in managed config
 codex-shim codex -- <args>   exec `codex` CLI through inline shim overrides
@@ -807,8 +868,8 @@ codex-model [list|<slug>]    shortcut for `codex-shim model …`
 
 Global flags:
 
-- `--settings <path>`: used by catalog/model/start/app/codex flows.
-- `--port <port>`: used by daemon/provider flows.
+- `--settings <path>`: used by catalog/model/start/app/codex/doctor flows.
+- `--port <port>`: used by daemon/provider/doctor flows.
 
 `patch-app` and `restore-app` always target `/Applications/Codex.app`, do not
 use `--settings`, and exit with a clear error on Windows/Linux.
@@ -828,10 +889,15 @@ restarting the CLI:
   `name = "..."` in `~/.codex/config.toml` so the Codex Desktop UI shows
   the selected model's display name (e.g. "Kimi K2.6") instead of the
   generic "Codex Shim" label, and optionally relaunches Codex Desktop
-  (`open -a Codex` on macOS, `taskkill` + `Codex.exe` on Windows).
+  (`open -a Codex` on macOS, `taskkill` + `Codex.exe` on Windows). This
+  state-changing picker endpoint requires the per-process
+  `X-Codex-Shim-Picker-Token` header embedded in `/picker`.
 
 All picker routes are behind the same `Host`-header allowlist as the rest of
-the shim, so a visited web page cannot drive them via DNS rebinding.
+the shim, so a visited web page cannot drive them via DNS rebinding. The
+state-changing `/api/switch` endpoint also requires a per-process picker token,
+so third-party pages cannot trigger model switches just because the loopback
+server is reachable.
 
 ---
 
@@ -845,6 +911,9 @@ the shim, so a visited web page cannot drive them via DNS rebinding.
   drives the shim with your credentials. If you deliberately bind to a
   non-loopback host, add the host(s) you reach it by to
   `CODEX_SHIM_ALLOWED_HOSTS` (comma-separated).
+- The model picker protects its state-changing `/api/switch` endpoint with a
+  per-process picker token, so cross-site pages cannot switch the active model
+  or request a Desktop restart without loading the picker page.
 - API keys stay in your settings file; the generated catalog does not contain
   them.
 - Request logs are summary-level by default and avoid full prompt/API-key dumps.
@@ -875,9 +944,17 @@ the shim, so a visited web page cannot drive them via DNS rebinding.
 ### Shim will not start
 
 ```bash
+codex-shim doctor
 codex-shim status
 tail -n 80 .codex-shim/shim.log
 ```
+
+`codex-shim doctor` prints a read-only diagnostics report grouped by section
+(Python, dependencies, Codex CLI, settings, runtime files, daemon health,
+passthrough availability, proxy bypass, and Codex config). It never writes
+configuration, starts/stops the daemon, calls model providers, or prints API
+keys/tokens. It exits 1 only when a hard `FAIL` is detected; warnings are meant
+as local setup hints.
 
 Common causes:
 

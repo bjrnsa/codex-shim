@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import secrets
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -42,17 +44,22 @@ from .settings import (
 )
 from .translate import (
     SHIM_ENCRYPTED_CONTENT_PREFIX,
+    anthropic_messages_to_chat,
     anthropic_to_chat_response,
     anthropic_to_response,
+    chat_completion_to_anthropic_message,
     chat_completion_to_response,
     chat_to_anthropic,
     normalize_responses_usage,
     responses_to_anthropic,
     responses_to_chat,
+    _chat_finish_to_anthropic_stop,
+    _responses_usage_to_anthropic_usage,
 )
 
 DEBUG_DIR = Path.home() / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
+PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
 
 
 class ShimServer:
@@ -60,6 +67,7 @@ class ShimServer:
         self.settings = ModelSettings(settings_path)
         self.host = host
         self.timeout = ClientTimeout(total=None, sock_connect=120, sock_read=None)
+        self.picker_token = secrets.token_urlsafe(32)
 
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
@@ -70,6 +78,7 @@ class ShimServer:
         app.router.add_get("/health", self.health)
         app.router.add_get("/v1/models", self.models)
         app.router.add_post("/v1/chat/completions", self.chat_completions)
+        app.router.add_post("/v1/messages", self.anthropic_messages)
         app.router.add_post("/v1/responses", self.responses)
         app.router.add_post("/v1/responses/compact", self.responses_compact)
         app.router.add_get("/picker", self.picker_page)
@@ -78,7 +87,7 @@ class ShimServer:
         return app
 
     async def picker_page(self, _request: web.Request) -> web.Response:
-        return web.Response(text=_picker_html(), content_type="text/html")
+        return web.Response(text=_picker_html(self.picker_token), content_type="text/html")
 
     async def api_models(self, _request: web.Request) -> web.Response:
         current = _current_managed_model()
@@ -124,7 +133,13 @@ class ShimServer:
             )
         return web.json_response(data)
 
+    def _valid_picker_token(self, request: web.Request) -> bool:
+        token = request.headers.get(PICKER_TOKEN_HEADER, "")
+        return secrets.compare_digest(token, self.picker_token)
+
     async def switch_model(self, request: web.Request) -> web.Response:
+        if not self._valid_picker_token(request):
+            return web.json_response({"error": "forbidden"}, status=403)
         try:
             body = await request.json()
         except json.JSONDecodeError:
@@ -208,6 +223,18 @@ class ShimServer:
         if route.is_anthropic:
             forwarded = chat_to_anthropic(body, route.model, route.max_output_tokens)
             return await self._post_anthropic(request, route, forwarded, as_responses=False)
+        raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
+
+    async def anthropic_messages(self, request: web.Request) -> web.StreamResponse:
+        body = await request.json()
+        route = self._route(body)
+        if route.is_openai_chat:
+            forwarded = anthropic_messages_to_chat(body, route.model, route.max_output_tokens)
+            return await self._post_openai_chat_as_anthropic(request, route, forwarded)
+        if route.is_anthropic:
+            forwarded = dict(body)
+            forwarded["model"] = route.model
+            return await self._post_anthropic_messages(request, route, forwarded)
         raise web.HTTPBadGateway(text=f"Unsupported model provider: {route.provider}")
 
     async def responses(self, request: web.Request) -> web.StreamResponse:
@@ -593,7 +620,8 @@ class ShimServer:
 
         response = _sse_response()
         await response.prepare(request)
-        state = ResponsesStreamState(slug)
+        tool_types = _build_tool_types(body)
+        state = ResponsesStreamState(slug, tool_types)
         try:
             await state.start(response)
             async for event in iter_cursor_agent_events(prompt, upstream):
@@ -670,7 +698,9 @@ class ShimServer:
                 classify = self._make_classifier(classifier_model, config)
         log = (lambda message: print(message, flush=True)) if router_module.router_log_enabled() else None
         resolved, _info = await router_module.resolve_auto(config, candidates, body, classify, log=log)
-        return resolved or router_module.fallback_slug(config, candidates)
+        return resolved or router_module.fallback_slug(
+            config, candidates, has_image_task=router_module.has_images(body)
+        )
 
     def _make_classifier(self, model: ShimModel, config):
         timeout = ClientTimeout(total=config.timeout + 5, sock_connect=config.timeout, sock_read=config.timeout)
@@ -714,12 +744,7 @@ class ShimServer:
         if route is None:
             raise web.HTTPNotFound(text=f"Unknown model slug/model: {requested}")
         if not byok_model_has_credentials(route):
-            raise web.HTTPUnauthorized(
-                text=(
-                    f"Model {route.slug} has no API key. "
-                    "Set CURSOR_API_KEY or create ~/.codex-shim/cursor-api-key."
-                )
-            )
+            raise web.HTTPUnauthorized(text=_missing_api_key_message(route))
         return route
 
     async def _post_openai_chat(
@@ -733,11 +758,29 @@ class ShimServer:
             if upstream.status >= 400:
                 return await _error_response(upstream, slug=route.slug)
             if body.get("stream"):
-                return await self._stream_openai_chat(request, upstream, route, as_responses)
+                return await self._stream_openai_chat(request, upstream, route, as_responses, body)
             payload = await upstream.json(content_type=None)
         if as_responses:
-            return web.json_response(chat_completion_to_response(payload, route.slug))
+            tool_types = _build_tool_types(body)
+            payload = chat_completion_to_response(payload, route.slug, tool_types)
+            intercepted = _maybe_intercept_web_search(payload)
+            return web.json_response(intercepted or payload)
         return web.json_response(payload)
+
+    async def _post_openai_chat_as_anthropic(
+        self, request: web.Request, route: ShimModel, body: dict[str, Any]
+    ) -> web.StreamResponse:
+        url = _join_url(route.base_url, "/chat/completions")
+        headers = _openai_headers(route)
+        _dump_debug_request(route.slug, url, body)
+        async with ClientSession(timeout=self.timeout) as session:
+            upstream = await session.post(url, json=body, headers=headers)
+            if upstream.status >= 400:
+                return await _anthropic_error_response(upstream)
+            if body.get("stream"):
+                return await self._stream_openai_chat_as_anthropic(request, upstream, route)
+            payload = await upstream.json(content_type=None)
+        return web.json_response(chat_completion_to_anthropic_message(payload, route.slug))
 
     async def _post_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool
@@ -749,19 +792,39 @@ class ShimServer:
             if upstream.status >= 400:
                 return await _error_response(upstream)
             if body.get("stream"):
-                return await self._stream_anthropic(request, upstream, route, as_responses)
+                return await self._stream_anthropic(request, upstream, route, as_responses, body)
             payload = await upstream.json(content_type=None)
         if as_responses:
-            return web.json_response(anthropic_to_response(payload, route.slug))
+            tool_types = _build_tool_types(body)
+            payload = anthropic_to_response(payload, route.slug, tool_types)
+            intercepted = _maybe_intercept_web_search(payload)
+            return web.json_response(intercepted or payload)
         return web.json_response(anthropic_to_chat_response(payload, route.slug))
 
+    async def _post_anthropic_messages(
+        self, request: web.Request, route: ShimModel, body: dict[str, Any]
+    ) -> web.StreamResponse:
+        url = _join_url(route.base_url, "/messages")
+        headers = _anthropic_headers(route)
+        async with ClientSession(timeout=self.timeout) as session:
+            upstream = await session.post(url, json=body, headers=headers)
+            if upstream.status >= 400:
+                return await _error_response(upstream, slug=route.slug)
+            if body.get("stream"):
+                return await self._stream_raw_sse(request, upstream, route.slug)
+            payload = await upstream.json(content_type=None)
+        if isinstance(payload, dict):
+            payload["model"] = route.slug
+        return web.json_response(payload)
+
     async def _stream_openai_chat(
-        self, request: web.Request, upstream, route: ShimModel, as_responses: bool
+        self, request: web.Request, upstream, route: ShimModel, as_responses: bool, body: dict[str, Any] | None = None
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
         if as_responses:
-            state = ResponsesStreamState(route.slug)
+            tool_types = _build_tool_types(body) if body else {}
+            state = ResponsesStreamState(route.slug, tool_types)
         try:
             if as_responses:
                 await state.start(response)
@@ -790,13 +853,41 @@ class ShimServer:
             pass
         return response
 
+    async def _stream_openai_chat_as_anthropic(
+        self, request: web.Request, upstream, route: ShimModel
+    ) -> web.StreamResponse:
+        response = _sse_response()
+        await response.prepare(request)
+        state = AnthropicMessagesStreamState(route.slug)
+        try:
+            await state.start(response)
+            async for line in _sse_lines(upstream):
+                if line == "[DONE]":
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                await state.write_chat_delta(response, event)
+            await state.finish(response)
+        except ClientDisconnected:
+            pass
+        finally:
+            upstream.release()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
+
     async def _stream_anthropic(
-        self, request: web.Request, upstream, route: ShimModel, as_responses: bool
+        self, request: web.Request, upstream, route: ShimModel, as_responses: bool, body: dict[str, Any] | None = None
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
         if as_responses:
-            state = ResponsesStreamState(route.slug)
+            tool_types = _build_tool_types(body) if body else {}
+            state = ResponsesStreamState(route.slug, tool_types)
         try:
             if as_responses:
                 await state.start(response)
@@ -815,6 +906,33 @@ class ShimServer:
                 await state.finish(response)
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
+        except ClientDisconnected:
+            pass
+        finally:
+            upstream.release()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
+
+    async def _stream_raw_sse(self, request: web.Request, upstream, model_slug: str | None = None) -> web.StreamResponse:
+        response = _sse_response()
+        await response.prepare(request)
+        try:
+            async for line in _sse_lines(upstream):
+                if model_slug and line.startswith("{"):
+                    try:
+                        event = json.loads(line)
+                        if isinstance(event, dict) and event.get("type") == "message_start":
+                            msg = event.get("message")
+                            if isinstance(msg, dict):
+                                msg["model"] = model_slug
+                        await _write_anthropic_sse(response, event.get("type", "message"), event)
+                        continue
+                    except json.JSONDecodeError:
+                        pass
+                await _safe_write(response, f"data: {line}\n\n".encode())
         except ClientDisconnected:
             pass
         finally:
@@ -874,6 +992,223 @@ def _rewrite_response_model(payload: Any, model: str | None) -> None:
             _rewrite_response_model(item, model)
 
 
+class AnthropicMessagesStreamState:
+    """Translates OpenAI chat-completions chunks into Anthropic Messages SSE."""
+
+    def __init__(self, model: str):
+        self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        self.model = model
+        self.next_index = 0
+        self.text_index: int | None = None
+        self.reasoning_index: int | None = None
+        self.text_open = False
+        self.reasoning_open = False
+        self.tool_calls: dict[int, dict[str, Any]] = {}
+        self.usage: dict[str, Any] | None = None
+        self.stop_reason = "end_turn"
+
+    async def start(self, response: web.StreamResponse) -> None:
+        await _write_anthropic_sse(
+            response,
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            },
+        )
+
+    async def write_chat_delta(self, response: web.StreamResponse, chunk: dict[str, Any]) -> None:
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            self.usage = normalize_responses_usage(usage)
+        choice = (chunk.get("choices") or [{}])[0]
+        finish_reason = choice.get("finish_reason")
+        if finish_reason:
+            self.stop_reason = _chat_finish_to_anthropic_stop(finish_reason)
+        delta = choice.get("delta") or {}
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if reasoning:
+            await self._reasoning_delta(response, str(reasoning))
+        content = delta.get("content")
+        if content:
+            if self.reasoning_open:
+                await self._close_reasoning(response)
+            await self._text_delta(response, str(content))
+        for call in delta.get("tool_calls") or []:
+            await self._tool_delta(response, call)
+
+    async def finish(self, response: web.StreamResponse) -> None:
+        if self.reasoning_open:
+            await self._close_reasoning(response)
+        if self.text_open:
+            await self._close_text(response)
+        for index in sorted(self.tool_calls):
+            state = self.tool_calls[index]
+            if not state.get("closed"):
+                await self._close_tool(response, index, state)
+        await _write_anthropic_sse(
+            response,
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
+                "usage": _responses_usage_to_anthropic_usage(self.usage) or {"output_tokens": 0},
+            },
+        )
+        await _write_anthropic_sse(response, "message_stop", {"type": "message_stop"})
+
+    async def _text_delta(self, response: web.StreamResponse, text: str) -> None:
+        if self.text_index is None:
+            self.text_index = self.next_index
+            self.next_index += 1
+            self.text_open = True
+            await _write_anthropic_sse(
+                response,
+                "content_block_start",
+                {"type": "content_block_start", "index": self.text_index, "content_block": {"type": "text", "text": ""}},
+            )
+        await _write_anthropic_sse(
+            response,
+            "content_block_delta",
+            {"type": "content_block_delta", "index": self.text_index, "delta": {"type": "text_delta", "text": text}},
+        )
+
+    async def _close_text(self, response: web.StreamResponse) -> None:
+        if self.text_index is None:
+            return
+        await _write_anthropic_sse(response, "content_block_stop", {"type": "content_block_stop", "index": self.text_index})
+        self.text_index = None
+        self.text_open = False
+
+    async def _reasoning_delta(self, response: web.StreamResponse, text: str) -> None:
+        if self.reasoning_index is None:
+            self.reasoning_index = self.next_index
+            self.next_index += 1
+            self.reasoning_open = True
+            await _write_anthropic_sse(
+                response,
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": self.reasoning_index,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            )
+        await _write_anthropic_sse(
+            response,
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": self.reasoning_index,
+                "delta": {"type": "thinking_delta", "thinking": text},
+            },
+        )
+
+    async def _close_reasoning(self, response: web.StreamResponse) -> None:
+        if self.reasoning_index is None:
+            return
+        await _write_anthropic_sse(
+            response,
+            "content_block_stop",
+            {"type": "content_block_stop", "index": self.reasoning_index},
+        )
+        self.reasoning_index = None
+        self.reasoning_open = False
+
+    async def _tool_delta(self, response: web.StreamResponse, call: dict[str, Any]) -> None:
+        index = int(call.get("index", 0))
+        fn = call.get("function") or {}
+        state = self.tool_calls.setdefault(
+            index,
+            {
+                "id": "",
+                "name": "",
+                "arguments": "",
+                "emitted": 0,
+                "block_index": None,
+                "open": False,
+                "closed": False,
+            },
+        )
+        if call.get("id"):
+            state["id"] = call["id"]
+        if fn.get("name"):
+            state["name"] += fn["name"]
+        if fn.get("arguments"):
+            state["arguments"] += fn["arguments"]
+        if not state["open"] and state["name"]:
+            if self.reasoning_open:
+                await self._close_reasoning(response)
+            if self.text_open:
+                await self._close_text(response)
+            await self._open_tool(response, index, state)
+        if state["open"] and len(state["arguments"]) > state["emitted"]:
+            delta = state["arguments"][state["emitted"] :]
+            state["emitted"] = len(state["arguments"])
+            await _write_anthropic_sse(
+                response,
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": state["block_index"],
+                    "delta": {"type": "input_json_delta", "partial_json": delta},
+                },
+            )
+
+    async def _open_tool(self, response: web.StreamResponse, index: int, state: dict[str, Any]) -> None:
+        state["block_index"] = self.next_index
+        self.next_index += 1
+        state["open"] = True
+        if not state["id"]:
+            state["id"] = f"call_{index}"
+        await _write_anthropic_sse(
+            response,
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": state["block_index"],
+                "content_block": {
+                    "type": "tool_use",
+                    "id": state["id"],
+                    "name": state["name"] or "tool",
+                    "input": {},
+                },
+            },
+        )
+
+    async def _close_tool(self, response: web.StreamResponse, index: int, state: dict[str, Any]) -> None:
+        if not state["open"]:
+            await self._open_tool(response, index, state)
+            if len(state["arguments"]) > state["emitted"]:
+                delta = state["arguments"][state["emitted"] :]
+                state["emitted"] = len(state["arguments"])
+                await _write_anthropic_sse(
+                    response,
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": state["block_index"],
+                        "delta": {"type": "input_json_delta", "partial_json": delta},
+                    },
+                )
+        await _write_anthropic_sse(
+            response,
+            "content_block_stop",
+            {"type": "content_block_stop", "index": state["block_index"]},
+        )
+        state["open"] = False
+        state["closed"] = True
+
+
 class ResponsesStreamState:
     """Translates upstream chat-completions / anthropic stream events into the
     Codex Desktop Responses-API event sequence. Keeps the message item and
@@ -881,22 +1216,22 @@ class ResponsesStreamState:
     proper .added / .delta / .done / .completed events plus a final
     `response.completed` with the full reconciled `output` array."""
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, tool_types: dict[str, str] | None = None):
         self.response_id = f"resp_{int(time.time() * 1000)}"
         self.message_item_id = f"msg_{int(time.time() * 1000)}"
         self.model = model
-        self.message_index: int | None = None  # output_index for the assistant message
+        self.message_index: int | None = None
         self.message_text = ""
         self.message_opened = False
         self.message_closed = False
         self.usage: dict[str, Any] | None = None
-        # Tool call state, keyed by upstream "index" (chat-completions) or
-        # anthropic content_block_index. Each entry tracks its assigned
-        # output_index, accumulated arguments, name, etc.
         self.tool_calls: dict[int, dict[str, Any]] = {}
-        # Reasoning (extended thinking) blocks, keyed by upstream index.
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
+        # Map sanitized tool name -> original Responses tool type so we can
+        # emit the correct output item type (e.g. custom_tool_call for freeform
+        # apply_patch instead of generic function_call).
+        self.tool_types = tool_types or {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1167,6 +1502,15 @@ class ResponsesStreamState:
             await self._close_message(response)
         output_index = self.next_output_index
         self.next_output_index += 1
+        # Determine output item type based on original tool type.
+        # Freeform tools (apply_patch with no schema) emit custom_tool_call
+        # so Codex Desktop knows not to validate against a fixed enum.
+        original_type = self.tool_types.get(name, "")
+        output_type = "function_call"
+        if original_type == "apply_patch":
+            output_type = "custom_tool_call"
+        elif original_type.startswith("web_search"):
+            output_type = "web_search_call"
         state: dict[str, Any] = {
             "id": call_id,
             "call_id": call_id,
@@ -1174,6 +1518,7 @@ class ResponsesStreamState:
             "arguments": "",
             "output_index": output_index,
             "closed": False,
+            "output_type": output_type,
         }
         self.tool_calls[key] = state
         await _write_sse(
@@ -1183,7 +1528,7 @@ class ResponsesStreamState:
                 "output_index": output_index,
                 "item": {
                     "id": call_id,
-                    "type": "function_call",
+                    "type": output_type,
                     "status": "in_progress",
                     "call_id": call_id,
                     "name": name,
@@ -1328,7 +1673,7 @@ class ResponsesStreamState:
     def _tool_item(self, state: dict[str, Any], status: str) -> dict[str, Any]:
         return {
             "id": state["id"],
-            "type": "function_call",
+            "type": state.get("output_type", "function_call"),
             "status": status,
             "call_id": state["call_id"],
             "name": state["name"],
@@ -1386,9 +1731,208 @@ def _decode_thinking_payload(encoded: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _build_tool_types(body: dict[str, Any]) -> dict[str, str]:
+    """Build a map sanitized tool name -> original tool type from the request tools array.
+
+    Codex Desktop emits native tools like `{"type": "apply_patch"}` and MCP tools
+    like `{"type": "mcp__node_repl", "function": {"name": "js"}}`. When we translate
+    those into chat-completions `function` tools, the original type is lost. We
+    preserve it here so the Responses streaming translator can emit the correct
+    output item type (e.g. `custom_tool_call` for freeform apply_patch instead of
+    generic `function_call`).
+    """
+    tool_types: dict[str, str] = {}
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type") or "").strip().lower()
+        fn = tool.get("function")
+        if isinstance(fn, dict) and fn.get("name"):
+            name = str(fn["name"]).strip()
+        elif tool.get("name"):
+            name = str(tool["name"]).strip()
+        else:
+            name = tool_type
+        clean = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip())[:64].strip("_")
+        if clean:
+            tool_types[clean] = tool_type
+    return tool_types
+
+async def _perform_web_search(query: str) -> str:
+    """Execute a web search via DuckDuckGo and return text results.
+
+    This is a server-side fallback for custom models whose provider does not
+    have a native web-search capability.  Codex Desktop expects the shim to
+    return results as a `function_call_output` (or `web_search_call`) item;
+    when the model is BYOK, the Desktop app does not execute the search itself,
+    so the shim must do it and feed the results back into the conversation.
+    """
+    import urllib.parse
+    import urllib.request
+
+    if not query or not query.strip():
+        return "No search query provided."
+
+    # DuckDuckGo lite HTML endpoint (no API key required)
+    url = (
+        "https://html.duckduckgo.com/html/"
+        + "?q="
+        + urllib.parse.quote_plus(query.strip())
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return f"Web search failed: {exc}"
+
+    # Extract title + snippet from result links
+    results: list[str] = []
+    # Each result is in a `.result` div with `.result__a` (title/link) and `.result__snippet`
+    from html.parser import HTMLParser
+
+    class _ResultParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.in_result = False
+            self.in_a = False
+            self.in_snippet = False
+            self.current_title = ""
+            self.current_snippet = ""
+            self.results: list[dict[str, str]] = []
+            self._tag_stack: list[str] = []
+            self._class_stack: list[str] = []
+
+        def _current_class(self) -> str:
+            return self._class_stack[-1] if self._class_stack else ""
+
+        def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+            attrs = dict(attrs_list)
+            cls = (attrs.get("class") or "").lower()
+            self._tag_stack.append(tag)
+            self._class_stack.append(cls)
+            if "result" in cls and tag == "div":
+                self.in_result = True
+                self.current_title = ""
+                self.current_snippet = ""
+            if self.in_result and tag == "a" and "result__a" in cls:
+                self.in_a = True
+            if self.in_result and ("result__snippet" in cls or "result__body" in cls):
+                self.in_snippet = True
+
+        def handle_endtag(self, tag: str) -> None:
+            if self._tag_stack and self._tag_stack[-1] == tag:
+                self._tag_stack.pop()
+                self._class_stack.pop()
+            if tag == "div" and self.in_result:
+                if self.current_title or self.current_snippet:
+                    self.results.append(
+                        {
+                            "title": self.current_title.strip(),
+                            "snippet": self.current_snippet.strip(),
+                        }
+                    )
+                self.in_result = False
+            if tag == "a":
+                self.in_a = False
+            if tag in {"div", "span", "p"}:
+                self.in_snippet = False
+
+        def handle_data(self, data: str) -> None:
+            if self.in_a:
+                self.current_title += data
+            if self.in_snippet:
+                self.current_snippet += data
+
+    parser = _ResultParser()
+    parser.feed(html)
+    for r in parser.results[:5]:
+        title = r["title"].replace("\n", " ")
+        snippet = r["snippet"].replace("\n", " ")
+        if title and snippet:
+            results.append(f"{title}\n{snippet}")
+        elif title:
+            results.append(title)
+        elif snippet:
+            results.append(snippet)
+
+    if not results:
+        return "No web search results found."
+    return "\n\n".join(results)
+
+def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """If the response payload contains a web_search_call, execute it server-side
+    and return a new payload with the results embedded as a function_call_output.
+
+    Returns None if no web_search_call is present (pass through unchanged).
+    """
+    output = payload.get("output") or []
+    if not isinstance(output, list):
+        return None
+    search_calls: list[tuple[int, dict[str, Any]]] = []
+    for i, item in enumerate(output):
+        if isinstance(item, dict) and item.get("type") == "web_search_call":
+            search_calls.append((i, item))
+    if not search_calls:
+        return None
+
+    # Build synthetic search results
+    results: list[dict[str, Any]] = []
+    for idx, call in search_calls:
+        try:
+            args = json.loads(call.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        query = args.get("query") or ""
+        # Run the search synchronously (non-streaming path only)
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            result_text = loop.run_until_complete(_perform_web_search(query))
+        except RuntimeError:
+            result_text = "Web search unavailable in this context."
+        results.append({
+            "id": f"wso_{call.get('call_id', '0')}",
+            "type": "function_call_output",
+            "status": "completed",
+            "call_id": call.get("call_id"),
+            "output": result_text,
+        })
+
+    # Replace web_search_call items with their results
+    new_output: list[dict[str, Any]] = []
+    for i, item in enumerate(output):
+        if isinstance(item, dict) and item.get("type") == "web_search_call":
+            # Find matching result
+            for r in results:
+                if r.get("call_id") == item.get("call_id"):
+                    new_output.append(r)
+                    break
+            else:
+                new_output.append(item)
+        else:
+            new_output.append(item)
+
+    new_payload = dict(payload)
+    new_payload["output"] = new_output
+    return new_payload
+
+
+_VERSIONED_BASE_RE = re.compile(r"(?:^|/)v\d+$")
+
+
 def _join_url(base_url: str, endpoint: str) -> str:
     base = base_url.rstrip("/")
-    if base.endswith("/v1"):
+    if _VERSIONED_BASE_RE.search(base):
+        # Already ends with /v<n> (e.g. /v1, /api/coding/v3) — append
+        # the endpoint as-is rather than injecting another /v1/.
         return base + endpoint
     if endpoint == "/messages":
         return base + "/v1/messages"
@@ -1459,6 +2003,22 @@ async def _write_sse(response: web.StreamResponse, payload: dict[str, Any]) -> N
     except Exception as exc:
         # aiohttp raises ClientConnectionResetError (an OSError subclass on
         # some versions, a ClientConnectionError on others). Trap both.
+        if exc.__class__.__name__ in {
+            "ClientConnectionResetError",
+            "ClientConnectionError",
+            "ClientPayloadError",
+        }:
+            raise ClientDisconnected() from exc
+        raise
+
+
+async def _write_anthropic_sse(response: web.StreamResponse, event: str, payload: dict[str, Any]) -> None:
+    data = json.dumps(payload, separators=(",", ":"))
+    try:
+        await response.write(f"event: {event}\ndata: {data}\n\n".encode())
+    except (ConnectionResetError, ConnectionError) as exc:
+        raise ClientDisconnected() from exc
+    except Exception as exc:
         if exc.__class__.__name__ in {
             "ClientConnectionResetError",
             "ClientConnectionError",
@@ -1610,6 +2170,48 @@ async def _error_response(upstream, *, slug: str | None = None) -> web.Response:
     return web.Response(status=upstream.status, text=text, content_type=upstream.content_type or "text/plain")
 
 
+async def _anthropic_error_response(upstream) -> web.Response:
+    text = await upstream.text()
+    message = text
+    error_type = "api_error"
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            message = str(err.get("message") or message)
+            error_type = str(err.get("type") or error_type)
+        elif payload.get("message"):
+            message = str(payload["message"])
+    status_type = {
+        400: "invalid_request_error",
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        413: "request_too_large",
+        429: "rate_limit_error",
+    }.get(upstream.status)
+    if status_type:
+        error_type = status_type
+    body = {
+        "type": "error",
+        "error": {"type": error_type, "message": message},
+    }
+    request_id = upstream.headers.get("request-id") or upstream.headers.get("x-request-id")
+    if request_id:
+        body["request_id"] = request_id
+    return web.json_response(body, status=upstream.status)
+
+
+def _missing_api_key_message(route: ShimModel) -> str:
+    env_name = route.raw.get("api_key_env") or route.raw.get("apiKeyEnv")
+    if env_name:
+        return f"Model {route.slug} has no API key. Set {env_name} or add api_key/apiKey for this model."
+    return f"Model {route.slug} has no API key. Add api_key/apiKey or api_key_env/apiKeyEnv for this model."
+
+
 def _normalize_roles(messages: list[dict]) -> list[dict]:
     result = []
     for message in messages:
@@ -1736,8 +2338,9 @@ def _restart_codex_app() -> None:
     _threading.Thread(target=_do_restart, daemon=True).start()
 
 
-def _picker_html() -> str:
-    return '''<!DOCTYPE html>
+def _picker_html(picker_token: str) -> str:
+    token_json = json.dumps(picker_token).replace("<", "\\u003c")
+    html = '''<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -1794,6 +2397,7 @@ def _picker_html() -> str:
   <p class="restart-note">Codex needs to restart to use the new model</p>
 </div>
 <script>
+const PICKER_TOKEN = @@TOKEN_JSON@@;
 async function loadModels() {
   const res = await fetch('/api/models');
   const models = await res.json();
@@ -1831,7 +2435,7 @@ async function switchModel(slug) {
   try {
     const res = await fetch('/api/switch', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', '@@PICKER_HEADER@@': PICKER_TOKEN},
       body: JSON.stringify({slug, restart_codex: restart})
     });
     const data = await res.json();
@@ -1852,6 +2456,9 @@ loadModels();
 </script>
 </body>
 </html>'''
+    return (
+        html.replace("@@TOKEN_JSON@@", token_json, 1).replace("@@PICKER_HEADER@@", PICKER_TOKEN_HEADER, 1)
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

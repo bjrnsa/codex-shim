@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from dataclasses import dataclass
+import importlib.util
 import os
 from pathlib import Path
 import hashlib
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -19,11 +24,17 @@ from .cursor_passthrough import (
     cursor_passthrough_display_names,
     is_cursor_passthrough_slug,
 )
+from .opencode_go import (
+    OPENCODE_GO_API_KEY_ENV,
+    OPENCODE_GO_BASE_URL,
+    refresh_opencode_go_settings,
+)
 from .settings import (
     CHATGPT_MODEL_SLUG,
     DEFAULT_SETTINGS,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    DEFAULT_CODEX_AUTH,
     PROVIDER_NAME,
     ModelSettings,
     available_model_slugs,
@@ -41,6 +52,8 @@ RUNTIME_DIR = Path.home() / ".codex-shim"
 CATALOG_PATH = RUNTIME_DIR / "custom_model_catalog.json"
 CONFIG_PATH = RUNTIME_DIR / "config.toml"
 PITCHFORK_PATH = RUNTIME_DIR / "pitchfork.toml"
+PID_PATH = RUNTIME_DIR / "shim.pid"
+LOG_PATH = RUNTIME_DIR / "shim.log"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 CODEX_CONFIG_BACKUP_PATH = RUNTIME_DIR / "config.toml.before-codex-shim"
 MANAGED_BEGIN = "# >>> codex-shim managed >>>"
@@ -51,15 +64,27 @@ APP_ASAR_BACKUP_NAME = "app.asar.before-codex-shim-model-picker-patch"
 INFO_PLIST_BACKUP_NAME = "Info.plist.before-codex-shim-model-picker-patch"
 SYSTEM_CODEX_APP = Path("/Applications/Codex.app")
 USER_CODEX_APP = Path.home() / "Applications" / "Codex.app"
-MODEL_PICKER_NEEDLE = "let u=c.useHiddenModels&&o!==`amazonBedrock`,d;"
-MODEL_PICKER_REPLACEMENT = "let u=!1,d;"
-SIDEBAR_RECENT_THREADS_NEEDLE = (
-    "listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,"
-    "{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:null,archived:!1,sourceKinds:ke})}"
+MODEL_PICKER_NEEDLE = re.compile(
+    r"(?P<lhs>(?:let )?\w+=)"
+    r"(?:\w+\.useHiddenModels|\w+)"
+    r"&&\w+!==\`amazonBedrock\`"
+    r"(?P<sep>[,;])"
+)
+MODEL_PICKER_REPLACEMENT = r"\g<lhs>!1\g<sep>"
+MODEL_PICKER_APPLIED = re.compile(
+    r"(?:let )?\w+=!1[,;][^\n]{0,300}\.forEach"
+)
+
+SIDEBAR_RECENT_THREADS_NEEDLE = re.compile(
+    r"listRecentThreads\(\{cursor:e,limit:t(?:,useStateDbOnly:\w+(?:=!\d)?)?\}\)\{return this\.params\.requestClient\.sendRequest\(\`thread/list\`,"
+    r"\{limit:t,cursor:e,sortKey:this\.recentConversationSortKey,modelProviders:null,archived:!1,sourceKinds:(\w+)(?:,useStateDbOnly:\w+)?\}\)\}"
 )
 SIDEBAR_RECENT_THREADS_REPLACEMENT = (
-    "listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,"
-    "{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:[],archived:!1,sourceKinds:ke})}"
+    r"listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,"
+    r"{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:[],archived:!1,sourceKinds:\1})}"
+)
+SIDEBAR_RECENT_THREADS_APPLIED = re.compile(
+    r"\.recentConversationSortKey,modelProviders:\[\],archived:!1,sourceKinds:\w+"
 )
 
 
@@ -76,8 +101,17 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("disable")
     sub.add_parser("restart")
     sub.add_parser("status")
+    sub.add_parser("doctor", help="Print a read-only local diagnostics report.")
     sub.add_parser("patch-app", help="Patch Codex Desktop picker/sidebar handling for custom shim models.")
     sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from the pre-patch backup.")
+
+    opencode_parser = sub.add_parser("opencode-go", help="Discover and configure OpenCode Go models.")
+    opencode_sub = opencode_parser.add_subparsers(dest="opencode_go_command", required=True)
+    refresh_parser = opencode_sub.add_parser("refresh", help="Refresh OpenCode Go models into the settings file.")
+    refresh_parser.add_argument("--api-key-env", default=OPENCODE_GO_API_KEY_ENV)
+    refresh_parser.add_argument("--base-url", default=OPENCODE_GO_BASE_URL)
+    refresh_parser.add_argument("--prefer", choices=["chat", "messages"], default="chat")
+    refresh_parser.add_argument("--timeout", type=float, default=30.0)
 
     model_parser = sub.add_parser("model", help="List or set the active shim model in Codex config.")
     model_sub = model_parser.add_subparsers(dest="model_command", required=True)
@@ -113,8 +147,13 @@ def main(argv: list[str] | None = None) -> int:
         return _pitchfork("start", "shim", "--force")
     if args.command == "status":
         return status(args.port)
+    if args.command == "doctor":
+        return doctor(args.settings, args.port)
     if args.command == "patch-app":
         return patch_codex_app()
+    if args.command == "opencode-go":
+        if args.opencode_go_command == "refresh":
+            return refresh_opencode_go(args.settings, args.api_key_env, args.base_url, args.prefer, args.timeout)
     if args.command == "restore-app":
         return restore_codex_app_bundle()
     if args.command == "model":
@@ -161,6 +200,320 @@ def _active_router(models, settings_path: Path):
     return None
 
 
+@dataclass(frozen=True)
+class DoctorCheck:
+    section: str
+    status: str  # OK | WARN | FAIL | INFO
+    message: str
+    detail: str = ""
+
+
+def doctor(settings_path: Path, port: int) -> int:
+    """Print a read-only diagnostics report for the local codex-shim setup."""
+    expanded = Path(settings_path).expanduser()
+    checks: list[DoctorCheck] = []
+    checks.extend(_doctor_python())
+    checks.extend(_doctor_dependencies())
+    checks.extend(_doctor_codex_cli())
+    checks.extend(_doctor_settings(expanded))
+    checks.extend(_doctor_runtime_files())
+    checks.extend(_doctor_daemon(port))
+    checks.extend(_doctor_chatgpt())
+    checks.extend(_doctor_cursor())
+    checks.extend(_doctor_proxy_env())
+    checks.extend(_doctor_codex_config())
+    _print_doctor_report(checks)
+    return 1 if any(check.status == "FAIL" for check in checks) else 0
+
+
+def _doctor_python() -> list[DoctorCheck]:
+    version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    status = "OK" if sys.version_info >= (3, 11) else "FAIL"
+    detail = "" if status == "OK" else "codex-shim requires Python 3.11+"
+    return [
+        DoctorCheck("Python", status, f"version: {version}", detail),
+        DoctorCheck("Python", "OK", f"executable: {sys.executable}"),
+    ]
+
+
+def _doctor_dependencies() -> list[DoctorCheck]:
+    if importlib.util.find_spec("aiohttp") is None:
+        return [
+            DoctorCheck(
+                "Dependencies",
+                "FAIL",
+                "aiohttp is not importable",
+                "Try: uv sync",
+            )
+        ]
+    return [DoctorCheck("Dependencies", "OK", "aiohttp importable")]
+
+
+def _doctor_codex_cli() -> list[DoctorCheck]:
+    found = shutil.which("codex")
+    if not found:
+        return [
+            DoctorCheck(
+                "Codex CLI",
+                "WARN",
+                "codex not found on PATH",
+                "Install and authenticate Codex before using codex-shim app/codex flows.",
+            )
+        ]
+    checks = [DoctorCheck("Codex CLI", "OK", f"found: {found}")]
+    try:
+        result = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        checks.append(DoctorCheck("Codex CLI", "WARN", "could not run codex --version", str(exc)))
+        return checks
+    output = (result.stdout or result.stderr).strip().splitlines()
+    version = output[0].strip() if output else "unknown"
+    if len(version) > 200:
+        version = version[:197] + "..."
+    if result.returncode == 0:
+        checks.append(DoctorCheck("Codex CLI", "OK", f"version: {version}"))
+    else:
+        checks.append(DoctorCheck("Codex CLI", "WARN", "codex --version failed", version))
+    return checks
+
+
+def _doctor_settings(settings_path: Path) -> list[DoctorCheck]:
+    section = "Settings"
+    path = settings_path.expanduser()
+    if not path.exists():
+        detail = "Create ~/.codex-shim/models.json or run codex login for ChatGPT passthrough-only use."
+        return [DoctorCheck(section, "WARN", f"settings file not found: {path}", detail)]
+    checks = [DoctorCheck(section, "OK", f"path: {path}")]
+    try:
+        models = _load_models(path)
+    except SystemExit as exc:
+        message = str(exc)
+        if "not valid JSON" in message or "invalid JSON" in message:
+            return [DoctorCheck(section, "FAIL", f"invalid JSON: {path}", message)]
+        return [DoctorCheck(section, "FAIL", f"could not load settings: {path}", message)]
+    except Exception as exc:
+        return [DoctorCheck(section, "FAIL", f"could not load settings: {path}", str(exc))]
+
+    usable = usable_byok_models(models)
+    missing_count = len(models) - len(usable)
+    checks.append(DoctorCheck(section, "OK", f"configured models: {len(models)}"))
+    checks.append(DoctorCheck(section, "OK", f"usable BYOK models: {len(usable)}"))
+    if missing_count:
+        checks.append(DoctorCheck(section, "WARN", f"models missing API keys: {missing_count}"))
+    else:
+        checks.append(DoctorCheck(section, "OK", "models missing API keys: 0"))
+    providers = Counter(model.provider for model in models)
+    provider_text = ", ".join(f"{provider}={count}" for provider, count in sorted(providers.items())) or "none"
+    checks.append(DoctorCheck(section, "INFO", f"providers: {provider_text}"))
+
+    router_config = router_module.load_router_config(path)
+    if router_config is None:
+        checks.append(DoctorCheck(section, "INFO", "auto router configured: false"))
+    else:
+        active = _active_router(models, path)
+        if active is not None:
+            checks.append(DoctorCheck(section, "OK", f"auto router active: {active.slug}"))
+        elif router_config.effective_enabled:
+            checks.append(
+                DoctorCheck(
+                    section,
+                    "WARN",
+                    f"auto router configured but inactive: {router_config.slug}",
+                    "Ensure at least one router candidate matches a usable model slug.",
+                )
+            )
+        else:
+            checks.append(DoctorCheck(section, "INFO", f"auto router configured but disabled: {router_config.slug}"))
+    return checks
+
+
+def _doctor_runtime_files() -> list[DoctorCheck]:
+    checks: list[DoctorCheck] = []
+    if CATALOG_PATH.exists():
+        checks.append(DoctorCheck("Runtime files", "OK", f"catalog: {CATALOG_PATH}"))
+        try:
+            data = json.loads(CATALOG_PATH.read_text())
+            models = data.get("models", []) if isinstance(data, dict) else []
+            count = len(models) if isinstance(models, list) else 0
+            checks.append(DoctorCheck("Runtime files", "OK", f"catalog models: {count}"))
+        except (OSError, json.JSONDecodeError) as exc:
+            checks.append(
+                DoctorCheck("Runtime files", "WARN", f"catalog JSON is not readable: {CATALOG_PATH}", str(exc))
+            )
+    else:
+        checks.append(DoctorCheck("Runtime files", "INFO", f"catalog missing: {CATALOG_PATH}"))
+    if CONFIG_PATH.exists():
+        checks.append(DoctorCheck("Runtime files", "OK", f"config: {CONFIG_PATH}"))
+    else:
+        checks.append(DoctorCheck("Runtime files", "INFO", f"config missing: {CONFIG_PATH}"))
+    if PID_PATH.exists():
+        checks.append(DoctorCheck("Runtime files", "INFO", f"pid file: {PID_PATH}"))
+    else:
+        checks.append(DoctorCheck("Runtime files", "INFO", f"pid file missing: {PID_PATH}"))
+    if LOG_PATH.exists():
+        checks.append(DoctorCheck("Runtime files", "INFO", f"log file: {LOG_PATH}"))
+    else:
+        checks.append(DoctorCheck("Runtime files", "INFO", f"log file missing: {LOG_PATH}"))
+    if PITCHFORK_PATH.exists():
+        checks.append(DoctorCheck("Runtime files", "OK", f"pitchfork config: {PITCHFORK_PATH}"))
+    else:
+        checks.append(DoctorCheck("Runtime files", "INFO", f"pitchfork config missing: {PITCHFORK_PATH}"))
+    return checks
+
+
+def _doctor_daemon(port: int) -> list[DoctorCheck]:
+    checks = [DoctorCheck("Shim daemon", "INFO", f"health URL: http://{DEFAULT_HOST}:{port}/health")]
+    health = _health(port)
+    if health is None:
+        checks.append(DoctorCheck("Shim daemon", "WARN", "health endpoint unavailable"))
+        return checks
+    model_count = _health_model_count(health.get("models"))
+    if health.get("ok") is True:
+        checks.append(DoctorCheck("Shim daemon", "OK", f"health ok: {model_count} models"))
+    else:
+        checks.append(DoctorCheck("Shim daemon", "WARN", f"health not ok: {model_count} models"))
+    for key in ("chatgpt_passthrough", "cursor_passthrough", "auto_router"):
+        if key in health:
+            checks.append(DoctorCheck("Shim daemon", "INFO", f"{key}: {_bool_text(health.get(key))}"))
+    return checks
+
+
+def _health_model_count(value) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, list):
+        return len(value)
+    return 0
+
+
+def _doctor_chatgpt() -> list[DoctorCheck]:
+    if _env_flag("CODEX_SHIM_DISABLE_CHATGPT"):
+        return [DoctorCheck("ChatGPT passthrough", "INFO", "disabled via CODEX_SHIM_DISABLE_CHATGPT")]
+    auth_path = Path(DEFAULT_CODEX_AUTH).expanduser()
+    if chatgpt_passthrough_available():
+        return [DoctorCheck("ChatGPT passthrough", "OK", f"available via {auth_path}")]
+    if auth_path.exists():
+        detail = "Run `codex login` again if you want ChatGPT/Codex passthrough."
+    else:
+        detail = "Run `codex login` if you want ChatGPT/Codex passthrough."
+    return [DoctorCheck("ChatGPT passthrough", "WARN", "unavailable", detail)]
+
+
+def _doctor_cursor() -> list[DoctorCheck]:
+    if _env_flag("CODEX_SHIM_DISABLE_CURSOR"):
+        return [DoctorCheck("Cursor passthrough", "INFO", "disabled via CODEX_SHIM_DISABLE_CURSOR")]
+    bin_override = os.environ.get("CURSOR_AGENT_BIN", "").strip()
+    agent_bin = bin_override or shutil.which("cursor-agent")
+    checks: list[DoctorCheck] = []
+    if agent_bin:
+        checks.append(DoctorCheck("Cursor passthrough", "INFO", f"cursor-agent: {agent_bin}"))
+    else:
+        checks.append(DoctorCheck("Cursor passthrough", "WARN", "cursor-agent not found on PATH"))
+    if cursor_passthrough_available():
+        checks.append(DoctorCheck("Cursor passthrough", "OK", "cursor-agent logged in"))
+        for slug in sorted(cursor_passthrough_display_names()):
+            checks.append(DoctorCheck("Cursor passthrough", "INFO", f"exposed model: {slug}"))
+    else:
+        checks.append(
+            DoctorCheck(
+                "Cursor passthrough",
+                "WARN",
+                "unavailable",
+                "Run `cursor-agent login` if you want Cursor passthrough.",
+            )
+        )
+    return checks
+
+
+def _doctor_proxy_env() -> list[DoctorCheck]:
+    required = {"127.0.0.1", "localhost", "::1"}
+    values: set[str] = set()
+    for key in ("NO_PROXY", "no_proxy"):
+        raw = os.environ.get(key, "")
+        for part in raw.split(","):
+            value = part.strip().lower()
+            if value:
+                values.add(value)
+    if "*" in values or required <= values:
+        return [DoctorCheck("Proxy", "OK", "loopback hosts covered by NO_PROXY/no_proxy")]
+    return [
+        DoctorCheck(
+            "Proxy",
+            "WARN",
+            "NO_PROXY/no_proxy does not include all loopback hosts",
+            "Recommended: 127.0.0.1,localhost,::1",
+        )
+    ]
+
+
+def _doctor_codex_config() -> list[DoctorCheck]:
+    path = Path(CODEX_CONFIG_PATH).expanduser()
+    if not path.exists():
+        return [
+            DoctorCheck(
+                "Codex config",
+                "INFO",
+                "shim provider is not currently installed",
+                "Run `codex-shim app .` or `codex-shim enable` to wire Codex to the shim.",
+            )
+        ]
+    checks = [DoctorCheck("Codex config", "OK", f"config exists: {path}")]
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        return [DoctorCheck("Codex config", "WARN", f"could not read config: {path}", str(exc))]
+    provider_configured = (
+        f'model_provider = "{PROVIDER_NAME}"' in text or f"[model_providers.{PROVIDER_NAME}]" in text
+    )
+    if provider_configured:
+        checks.append(DoctorCheck("Codex config", "OK", "shim provider configured"))
+    else:
+        checks.append(
+            DoctorCheck(
+                "Codex config",
+                "INFO",
+                "shim provider is not currently installed",
+                "Run `codex-shim app .` or `codex-shim enable` to wire Codex to the shim.",
+            )
+        )
+    current = _current_managed_model()
+    if current:
+        checks.append(DoctorCheck("Codex config", "OK", f"active shim model: {current}"))
+    else:
+        checks.append(DoctorCheck("Codex config", "INFO", "active shim model: none"))
+    return checks
+
+
+def _print_doctor_report(checks: list[DoctorCheck]) -> None:
+    current_section = None
+    for check in checks:
+        if check.section != current_section:
+            if current_section is not None:
+                print()
+            print(check.section)
+            current_section = check.section
+        print(f"  {check.status:<5} {check.message}")
+        if check.detail:
+            for line in check.detail.splitlines():
+                print(f"        {line}")
+    counts = Counter(check.status for check in checks)
+    summary_status = "FAIL" if counts["FAIL"] else "OK"
+    print()
+    print("Summary")
+    print(
+        f"  {summary_status:<5} "
+        f"{counts['OK']} ok, {counts['WARN']} warn, {counts['FAIL']} fail, {counts['INFO']} info"
+    )
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _bool_text(value) -> str:
+    return "true" if bool(value) else "false"
+
+
 def generate(settings_path: Path, port: int) -> None:
     models = _load_models(settings_path)
     try:
@@ -178,6 +531,29 @@ def generate(settings_path: Path, port: int) -> None:
     print(f"  config:  {CONFIG_PATH}")
     print(f"  daemon:  {PITCHFORK_PATH}")
     print("No files under ~/.codex were modified.")
+
+
+def refresh_opencode_go(settings_path: Path, api_key_env: str, base_url: str, prefer: str, timeout: float) -> int:
+    print(f"Refreshing OpenCode Go models from {base_url}...")
+    try:
+        result = refresh_opencode_go_settings(
+            settings_path,
+            api_key_env=api_key_env,
+            base_url=base_url,
+            prefer=prefer,
+            timeout=timeout,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"Refreshed {len(result.models)} OpenCode Go models into {result.settings_path}.")
+    if result.skipped:
+        print(f"Skipped {len(result.skipped)} models with no working probed endpoint:")
+        for model_id, chat_status, messages_status in result.skipped:
+            print(f"  {model_id}: chat={chat_status}, messages={messages_status}")
+    for row in result.models:
+        print(f"  {row['slug']}  ->  {row['model']} ({row['provider']}, {row['opencode_go_endpoint']})")
+    return 0
 
 
 def install_codex_config(settings_path: Path, port: int, model_slug: str | None = None) -> None:
@@ -256,7 +632,7 @@ def _pitchfork(*args: str) -> int:
     return subprocess.call(["pitchfork", *args], cwd=str(PITCHFORK_PATH.parent))
 
 
-def _healthy(port: int) -> dict | None:
+def _health(port: int) -> dict | None:
     try:
         with urlopen(f"http://{DEFAULT_HOST}:{port}/health", timeout=2) as resp:
             if resp.status == 200:
@@ -264,6 +640,16 @@ def _healthy(port: int) -> dict | None:
     except Exception:
         pass
     return None
+
+
+def _read_pid() -> int | None:
+    """Compatibility stub; daemon management is delegated to pitchfork."""
+    return None
+
+
+def _pid_running(pid: int | None) -> bool:
+    """Compatibility stub; daemon management is delegated to pitchfork."""
+    return False
 
 
 def restore_codex_config() -> None:
@@ -439,24 +825,30 @@ def _patch_codex_desktop_bundles(workdir: Path) -> bool | None:
     patches = [
         (
             "model picker allowlist filter",
-            ["model-queries-*.js", "*.js"],
+            [
+                "models-and-reasoning-efforts-*.js",
+                "model-queries-*.js",
+                "*.js",
+            ],
             MODEL_PICKER_NEEDLE,
             MODEL_PICKER_REPLACEMENT,
+            MODEL_PICKER_APPLIED,
         ),
         (
             "shim-mode sidebar provider filter",
             ["app-server-manager-signals-*.js", "*.js"],
             SIDEBAR_RECENT_THREADS_NEEDLE,
             SIDEBAR_RECENT_THREADS_REPLACEMENT,
+            SIDEBAR_RECENT_THREADS_APPLIED,
         ),
     ]
     changed = False
-    for label, globs, needle, replacement in patches:
-        bundle_file = _find_js_bundle(workdir, globs, needle, replacement)
+    for label, globs, needle, replacement, applied in patches:
+        bundle_file = _find_js_bundle(workdir, globs, needle, applied)
         if bundle_file is None:
             print(f"Could not find the expected {label} in Codex Desktop.", file=sys.stderr)
             return None
-        result = _replace_once(bundle_file, needle, replacement)
+        result = _replace_once(bundle_file, needle, replacement, applied)
         if result is None:
             print(f"Could not patch the expected {label} in Codex Desktop.", file=sys.stderr)
             return None
@@ -468,7 +860,12 @@ def _patch_codex_desktop_bundles(workdir: Path) -> bool | None:
     return changed
 
 
-def _find_js_bundle(workdir: Path, globs: list[str], needle: str, replacement: str) -> Path | None:
+def _find_js_bundle(
+    workdir: Path,
+    globs: list[str],
+    needle: re.Pattern[str],
+    applied: re.Pattern[str],
+) -> Path | None:
     assets_dir = workdir / "webview" / "assets"
     if not assets_dir.exists():
         return None
@@ -477,19 +874,26 @@ def _find_js_bundle(workdir: Path, globs: list[str], needle: str, replacement: s
         candidates.extend(p for p in sorted(assets_dir.glob(pattern)) if p not in candidates)
     for path in candidates:
         text = _read_text_lossy(path)
-        if needle in text or replacement in text:
+        if needle.search(text) or applied.search(text):
             return path
     return None
 
 
-def _replace_once(path: Path, needle: str, replacement: str) -> bool | None:
+def _replace_once(
+    path: Path,
+    needle: re.Pattern[str],
+    replacement: str,
+    applied: re.Pattern[str],
+) -> bool | None:
     text = _read_text_lossy(path)
-    if replacement in text:
-        return False
-    count = text.count(needle)
-    if count != 1:
+    matches = needle.findall(text)
+    if not matches:
+        if applied.search(text):
+            return False
         return None
-    path.write_text(text.replace(needle, replacement, 1))
+    if len(matches) != 1:
+        return None
+    path.write_text(needle.sub(replacement, text, count=1))
     return True
 
 
@@ -541,7 +945,7 @@ def _app_asar_is_patched(app_asar: Path) -> bool:
         text = app_asar.read_bytes().decode("utf-8", errors="ignore")
     except OSError:
         return False
-    return MODEL_PICKER_REPLACEMENT in text and SIDEBAR_RECENT_THREADS_REPLACEMENT in text
+    return MODEL_PICKER_APPLIED.search(text) is not None and SIDEBAR_RECENT_THREADS_APPLIED.search(text) is not None
 
 
 def _resign_codex_app(codex_app: Path = SYSTEM_CODEX_APP) -> None:
